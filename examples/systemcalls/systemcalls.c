@@ -1,3 +1,10 @@
+#include "stdlib.h"
+#include "string.h"
+#include "fcntl.h"
+#include "unistd.h"
+#include "syslog.h"
+#include "sys/wait.h"
+#include "errno.h"
 #include "systemcalls.h"
 
 /**
@@ -9,15 +16,50 @@
 */
 bool do_system(const char *cmd)
 {
+    bool b_status = false;
+    const int return_code = system(cmd);
 
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
+    if ((NULL == cmd))
+    {
+        // if cmd is NULL, the call to system will return a non-zero value if a
+        // shell is available in the system
+        if (0 == return_code)
+        {
+            syslog(LOG_DEBUG, "No shell available in the system!");
+        } 
+        else
+        {
+            syslog(LOG_DEBUG, "Shell available in the system!");
+        }
+    }
+    else if (-1 == return_code)
+    {
+        // child process could not be created/run
+        // check errno for the error
+        syslog(LOG_ERR, "Could not create/run child process for command %s, with error: %s", cmd, strerror(errno));
+    }
+    else
+    {
+        if (WIFEXITED(return_code))
+        {
+            int termination_status = WEXITSTATUS(return_code);
+            if (termination_status == 0)
+            {
+                // command successfully executed
+                b_status = true;
+            }
+            else
+            {
+                syslog(LOG_ERR, "Child process for command %s terminated with status %d", cmd, termination_status);
+            }
+        }
+        else
+        {
+            syslog(LOG_ERR, "Child process for command %s did not terminate normally", cmd);
+        }
+    }
 
-    return true;
+    return b_status;
 }
 
 /**
@@ -45,23 +87,60 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
-/*
- * TODO:
- *   Execute a system command by calling fork, execv(),
- *   and wait instead of system (see LSP page 161).
- *   Use the command[0] as the full path to the command to execute
- *   (first argument to execv), and use the remaining arguments
- *   as second argument to the execv() command.
- *
-*/
+    bool b_status = false;
+    const pid_t pid = fork();
 
+    if (pid == -1)
+    {
+        // call to fork failed, check errno
+        syslog(LOG_ERR, "Could not fork() with error: %s", strerror(errno));
+    }
+    else if (pid == 0)
+    {
+        // child process, use exec syscall to replace process with 
+        // command
+        const char * pathname = command[0];
+        char ** const arg = command;
+        int return_code = execv(pathname, arg);
+        if (return_code == -1)
+        {
+            // call to exec failed! check errno, and return error to 
+            // parent process
+            syslog(LOG_ERR, "Could not fork() with error: %s", strerror(errno));
+            exit(1);
+        }
+    }
+    else
+    {
+        // parent process, wait for termination of child process and examine its
+        // status
+        int return_code;
+        if (-1 == waitpid(pid, &return_code, 0))
+        {
+            syslog(LOG_ERR, "Call to waitpid failed with error: %s", strerror(errno));
+        }
+        else if (WIFEXITED(return_code))
+        {
+            int termaination_status = WEXITSTATUS(return_code);
+            if (termaination_status == 0)
+            {
+                // command successfully executed
+                b_status = true;
+            }
+            else
+            {
+                syslog(LOG_ERR, "Child process for terminated with status %d", termaination_status);
+            }
+        }
+        else
+        {
+            syslog(LOG_ERR, "Child process for command did not terminate normally");
+        }
+    }
     va_end(args);
 
-    return true;
+    return b_status;
 }
 
 /**
@@ -80,20 +159,82 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
+    bool b_status = false;
+    const pid_t pid = fork();
 
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
+    if (pid == -1)
+    {
+        // call to fork failed, check errno
+        syslog(LOG_ERR, "Could not fork() with error: %s", strerror(errno));
+    }
+    else if (pid == 0)
+    {
+        // child process, redirect STDOUT to outputfile
+        // then use exec syscall to replace process with 
+        // command
+
+        // create outputfile with 0644 permissions
+        int h_outputfile = open(outputfile, O_WRONLY | O_TRUNC | O_CREAT, S_IWUSR | S_IRUSR |  S_IRGRP | S_IROTH);
+        if (h_outputfile < 0)
+        {
+            syslog(LOG_ERR, "Could not create outputfile %s with error: %s", outputfile, strerror(errno));
+            exit(1);
+        }
+
+        // redirect STDOUT to outputfile
+        if (dup2(h_outputfile, STDOUT_FILENO) < 0)
+        {
+            syslog(LOG_ERR, "Could not redirect STDOUT to outputfile %s with error: %s", outputfile, strerror(errno));
+            exit(1);
+        }
+        else
+        {
+            // STDOUT has been redirected to outputfile, 
+            // we can close the h_outputfile fd
+            close(h_outputfile);
+        }
+
+        const char * pathname = command[0];
+        char ** const arg = command;
+        int return_code = execv(pathname, arg);
+        if (return_code == -1)
+        {
+            // call to exec failed! check errno, and return error to 
+            // parent process
+            syslog(LOG_ERR, "Could not fork() with error: %s", strerror(errno));
+            exit(1);
+        }
+    }
+    else
+    {
+        // parent process, wait for termination of child process and examine its
+        // status
+        int return_code;
+        if (-1 == waitpid(pid, &return_code, 0))
+        {
+            syslog(LOG_ERR, "Call to waitpid failed with error: %s", strerror(errno));
+        }
+        else if (WIFEXITED(return_code))
+        {
+            int termaination_status = WEXITSTATUS(return_code);
+            if (termaination_status == 0)
+            {
+                // command successfully executed
+                b_status = true;
+            }
+            else
+            {
+                syslog(LOG_ERR, "Child process for terminated with status %d", termaination_status);
+            }
+        }
+        else
+        {
+            syslog(LOG_ERR, "Child process for command did not terminate normally");
+        }
+    }
 
     va_end(args);
 
-    return true;
+    return b_status;
 }
