@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # @file finder.sh
 # @author krish shah
 # @brief Implements a shell script to search all the files in the given 
