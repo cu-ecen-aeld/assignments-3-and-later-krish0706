@@ -15,7 +15,7 @@ ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
 YYLLOC_FIX_COMMIT_HASH=e33a814e772cdc36436c8c188d8c42d019fda639
 YYLLOC_FIX_FILE="scripts/dtc/dtc-lexer.l"
-ARM_CROSS_COMPILER_ROOT="/home/kshah/Documents/AESD/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu"
+ARM_CROSS_COMPILER_SYSROOT="$(${CROSS_COMPILE}gcc -print-sysroot)"
 
 if [ $# -lt 1 ]
 then
@@ -48,7 +48,6 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} mrproper
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} all
-    # make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} modules
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} dtbs
 fi
 
@@ -93,10 +92,10 @@ cd "$OUTDIR"
 ${CROSS_COMPILE}readelf -a ./rootfs/bin/busybox | grep "program interpreter"
 ${CROSS_COMPILE}readelf -a ./rootfs/bin/busybox | grep "Shared library"
 
-cp ${ARM_CROSS_COMPILER_ROOT}/aarch64-none-linux-gnu/libc/lib/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib
-cp ${ARM_CROSS_COMPILER_ROOT}/aarch64-none-linux-gnu/libc/lib64/libm.so.6 ${OUTDIR}/rootfs/lib64/
-cp ${ARM_CROSS_COMPILER_ROOT}/aarch64-none-linux-gnu/libc/lib64/libresolv.so.2 ${OUTDIR}/rootfs/lib64/
-cp ${ARM_CROSS_COMPILER_ROOT}/aarch64-none-linux-gnu/libc/lib64/libc.so.6 ${OUTDIR}/rootfs/lib64/
+cp ${ARM_CROSS_COMPILER_SYSROOT}/lib/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib
+cp ${ARM_CROSS_COMPILER_SYSROOT}/lib64/libm.so.6 ${OUTDIR}/rootfs/lib64/
+cp ${ARM_CROSS_COMPILER_SYSROOT}/lib64/libresolv.so.2 ${OUTDIR}/rootfs/lib64/
+cp ${ARM_CROSS_COMPILER_SYSROOT}/lib64/libc.so.6 ${OUTDIR}/rootfs/lib64/
 
 echo "Make device nodes"
 cd "$OUTDIR"
