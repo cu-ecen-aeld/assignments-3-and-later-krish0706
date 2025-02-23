@@ -245,6 +245,11 @@ bool daemonize_process(void)
                 b_status = false;
                 syslog(LOG_ERR, "dup2 failed to redirect");
             }
+            if (-1 == close(null_fd))
+            {
+                b_status = false;
+                syslog(LOG_ERR, "close failed with error: %s\n", strerror(errno));
+            }
         }
 
     }
