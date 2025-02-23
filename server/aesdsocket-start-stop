@@ -1,0 +1,12 @@
+#!/bin/sh
+EXEC_NAME="aesdsocket"
+
+cd $(dirname "$0")
+if [ ! -f $EXEC_NAME ];
+then
+    echo "$EXEC_NAME does not exist!"
+    exit 1
+fi
+
+#TODO: check if we need to terminate already existing daemon
+start-stop-daemon --start -s TERM --exec $(realpath $EXEC_NAME) -- -d
