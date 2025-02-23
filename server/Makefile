@@ -2,7 +2,7 @@ SRCS=aesdsocket.c
 OBJS=$(SRCS:.c=.o)
 TARGET=aesdsocket
 
-CC = $(cross_compile)gcc
+CC = $(CROSS_COMPILE)gcc
 CFLAGS = -Wall -Werror -Wextra -g
 
 .PHONY:all

@@ -269,12 +269,13 @@ int main(const int argc, char ** const p_argv)
     int h_sockfd = 0;
     FILE * ph_socket_data_file = NULL;
     char p_ip_addr_buffer[INET_ADDRSTRLEN];
-    char opt_char;
+    int opt_char;
     struct sockaddr_in remote_client_addr;
     bool b_daemonize = false;
 
     if (argc > 2)
     {
+        syslog(LOG_ERR, "Invalid number of arguement");
         print_help_str();
         exit(EXIT_FAILURE);
     }
@@ -288,6 +289,7 @@ int main(const int argc, char ** const p_argv)
             break;
 
             default:
+                syslog(LOG_ERR, "Invalid option %c!", opt_char);
                 print_help_str();
                 exit(EXIT_APP_FAILURE);
             break;
