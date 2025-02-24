@@ -262,6 +262,34 @@ bool daemonize_process(void)
     return b_status;
 }
 
+// @brief block signals specified by p_sig_mask
+bool block_signals(sigset_t const * const p_sig_mask)
+{
+    bool b_status = true;
+
+    if (-1 == sigprocmask(SIG_BLOCK, p_sig_mask, NULL))
+    {
+        syslog(LOG_ERR, "sigprocmask block failed with error: %s\n", strerror(errno));
+        b_status = false;
+    }
+
+    return b_status;
+}
+
+// @brief unblock signals specified by p_sig_mask
+bool unblock_signals(sigset_t const * const p_sig_mask)
+{
+    bool b_status = true;
+
+    if (-1 == sigprocmask(SIG_UNBLOCK, p_sig_mask, NULL))
+    {
+        syslog(LOG_ERR, "sigprocmask unblock failed with error: %s\n", strerror(errno));
+        b_status = false;
+    }
+
+    return b_status;
+}
+
 int main(const int argc, char ** const p_argv)
 {
     int return_code = 0;
@@ -272,12 +300,13 @@ int main(const int argc, char ** const p_argv)
     int opt_char;
     struct sockaddr_in remote_client_addr;
     bool b_daemonize = false;
+    sigset_t sig_mask;
 
     if (argc > 2)
     {
         syslog(LOG_ERR, "Invalid number of arguement");
         print_help_str();
-        exit(EXIT_FAILURE);
+        exit(EXIT_APP_FAILURE);
     }
 
     while ((opt_char = getopt(argc, p_argv, "d")) != -1)
@@ -294,6 +323,19 @@ int main(const int argc, char ** const p_argv)
                 exit(EXIT_APP_FAILURE);
             break;
         }
+    }
+
+    // create a signal mask to block SIGINT and SIGTERM when a connection is open
+    if (-1 == sigemptyset(&sig_mask))
+    {
+        syslog(LOG_ERR, "sigemptyset failed with error: %s", strerror(errno));
+        exit(EXIT_APP_FAILURE);
+    }
+
+    if ((-1 == sigaddset(&sig_mask, SIGINT) || (-1 == sigaddset(&sig_mask, SIGTERM))))
+    {
+        syslog(LOG_ERR, "sigaddset failed with error: %s", strerror(errno));
+        exit(EXIT_APP_FAILURE);
     }
 
     if (!bind_to_address(NULL, PORT, &h_sockfd))
@@ -352,6 +394,13 @@ int main(const int argc, char ** const p_argv)
                 break;
             }
             syslog(LOG_DEBUG, "Accepted connection from %s\n", p_ip_addr_buffer);
+        }
+
+        // connection is now open, block signals till operations are complete
+        if (!block_signals(&sig_mask))
+        {
+            syslog(LOG_ERR, "could not block signals!");
+            break;
         }
 
         char p_buffer[RECV_BUF_LEN] = {0};
@@ -427,6 +476,13 @@ int main(const int argc, char ** const p_argv)
         }
         // logs messsage to syslog "Closed connection from XXX"
         syslog(LOG_DEBUG, "Closed connection from %s\n", p_ip_addr_buffer);
+
+        // connection is now closed, unblock signals 
+        if (!unblock_signals(&sig_mask))
+        {
+            syslog(LOG_ERR, "could not unblock signals!");
+            break;
+        }
     }
 
     if (-1 == remove(SOCKET_DATA_FILE_PATHNAME))
