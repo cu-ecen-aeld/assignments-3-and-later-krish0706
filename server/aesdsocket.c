@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <netdb.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define SOCKET_DATA_FILE_PATHNAME "/var/tmp/aesdsocketdata"
 #define PORT "9000" // the port to connect to
@@ -28,12 +30,30 @@
 
 #define EXIT_SOCKET_FAILURE (-1)
 #define EXIT_APP_FAILURE (-1)
+#define MAX_TIMESTAMP_LEN 995
 
+struct thread_args_s
+{
+    struct sockaddr_in remote_client_address;
+    pthread_mutex_t * p_mutex;
+    int h_recvfd;
+    bool b_is_thread_complete;
+    pthread_t tid;
+};
+
+struct slist_entry_s
+{
+    struct thread_args_s thread_args;
+    SLIST_ENTRY(slist_entry_s) slist_entries;
+};
+
+SLIST_HEAD(slist_head_s, slist_entry_s);
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool b_accept_connections = true;
 
 // @brief signal handler to redirect SIGINT and SIGTERM 
 // to gracefully exit application
-void signal_handler(int signo)
+static void signal_handler(int signo)
 {
     if ((SIGINT == signo) || SIGTERM == signo)
     {
@@ -43,7 +63,7 @@ void signal_handler(int signo)
 }
 
 // @brief bind to given node and service 
-bool bind_to_address(char const * const p_node, char const * const p_service, int * const p_socket_fd)
+static bool bind_to_address(char const * const p_node, char const * const p_service, int * const p_socket_fd)
 {
     struct addrinfo hints;
     struct addrinfo * p_result;
@@ -108,7 +128,7 @@ bool bind_to_address(char const * const p_node, char const * const p_service, in
 }
 
 // @brief open the socket data file for appending received data
-bool open_socket_data_file(char const * const p_pathname, FILE ** const pph_socket_data_file)
+static bool open_socket_data_file(char const * const p_pathname, FILE ** const pph_socket_data_file)
 {
     bool b_status = true;
 
@@ -124,7 +144,7 @@ bool open_socket_data_file(char const * const p_pathname, FILE ** const pph_sock
 }
 
 // @brief redirect SIGINT and SIGTERM to signal handler
-bool assign_signal_handler(void)
+static bool assign_signal_handler(void)
 {
     bool b_status = true;
     struct sigaction action = {0};
@@ -146,7 +166,7 @@ bool assign_signal_handler(void)
 }
 
 // @brief read contents of socket data file and send it back over socket connection
-bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
+static bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
 {
     // loop till eof, then break 
     ssize_t line_size = 0;
@@ -158,7 +178,7 @@ bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
     // set file offet to 0 before reading
     if (-1 == fseek(ph_socket_data_file, 0, SEEK_SET))
     {
-        syslog(LOG_ERR, "fseek failed with error %s", strerror(errno));
+        syslog(LOG_ERR, "fseek set failed with error %s", strerror(errno));
         b_status = false;
     }
     else
@@ -191,18 +211,25 @@ bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
     }
 
     free(p_line); 
+
+    if (-1 == fseek(ph_socket_data_file, 0, SEEK_END))
+    {
+        syslog(LOG_ERR, "fseek end failed with error %s", strerror(errno));
+        b_status = false;
+    }
+
     return b_status;
 }
 
 // @brief to print help string for application
-void print_help_str(void)
+static void print_help_str(void)
 {
     printf("Usage: ./aesdsocket [-d]\n");
     printf("Use optional argument -d to daemonize process\n");
 }
 
 // @brief function to daemonize the process
-bool daemonize_process(void)
+static bool daemonize_process(void)
 {
     bool b_status = true;
 
@@ -262,155 +289,32 @@ bool daemonize_process(void)
     return b_status;
 }
 
-// @brief block signals specified by p_sig_mask
-bool block_signals(sigset_t const * const p_sig_mask)
+// @brief function for service thread, to handle read and writeback on a new connection
+static void * service_thread(void * p_arg)
 {
-    bool b_status = true;
-
-    if (-1 == sigprocmask(SIG_BLOCK, p_sig_mask, NULL))
-    {
-        syslog(LOG_ERR, "sigprocmask block failed with error: %s\n", strerror(errno));
-        b_status = false;
-    }
-
-    return b_status;
-}
-
-// @brief unblock signals specified by p_sig_mask
-bool unblock_signals(sigset_t const * const p_sig_mask)
-{
-    bool b_status = true;
-
-    if (-1 == sigprocmask(SIG_UNBLOCK, p_sig_mask, NULL))
-    {
-        syslog(LOG_ERR, "sigprocmask unblock failed with error: %s\n", strerror(errno));
-        b_status = false;
-    }
-
-    return b_status;
-}
-
-int main(const int argc, char ** const p_argv)
-{
-    int return_code = 0;
-    int h_recvfd = 0;
-    int h_sockfd = 0;
     FILE * ph_socket_data_file = NULL;
+    char p_buffer[RECV_BUF_LEN] = {0};
     char p_ip_addr_buffer[INET_ADDRSTRLEN];
-    int opt_char;
-    struct sockaddr_in remote_client_addr;
-    bool b_daemonize = false;
-    sigset_t sig_mask;
+    int malloc_buf_size = 0;
+    int byte_string_len = 0;
+    char * p_malloc_buf = NULL;
+    char * p_tmp = NULL;
+    int return_code; 
 
-    if (argc > 2)
+    struct thread_args_s * p_thread_args = (struct thread_args_s *)p_arg;
+
+    // log message to syslog "Accecpted connection from xxxx"
+    if (NULL == inet_ntop(AF_INET, &p_thread_args->remote_client_address.sin_addr, p_ip_addr_buffer, sizeof(p_ip_addr_buffer)))
     {
-        syslog(LOG_ERR, "Invalid number of arguement");
-        print_help_str();
-        exit(EXIT_APP_FAILURE);
+        syslog(LOG_ERR, "inet_ntop failed with error: %s\n", strerror(errno));
     }
-
-    while ((opt_char = getopt(argc, p_argv, "d")) != -1)
+    else
     {
-        switch (opt_char)
-        {
-            case 'd':
-                b_daemonize = true;
-            break;
-
-            default:
-                syslog(LOG_ERR, "Invalid option %c!", opt_char);
-                print_help_str();
-                exit(EXIT_APP_FAILURE);
-            break;
-        }
-    }
-
-    // create a signal mask to block SIGINT and SIGTERM when a connection is open
-    if (-1 == sigemptyset(&sig_mask))
-    {
-        syslog(LOG_ERR, "sigemptyset failed with error: %s", strerror(errno));
-        exit(EXIT_APP_FAILURE);
-    }
-
-    if ((-1 == sigaddset(&sig_mask, SIGINT) || (-1 == sigaddset(&sig_mask, SIGTERM))))
-    {
-        syslog(LOG_ERR, "sigaddset failed with error: %s", strerror(errno));
-        exit(EXIT_APP_FAILURE);
-    }
-
-    if (!bind_to_address(NULL, PORT, &h_sockfd))
-    {
-        syslog(LOG_ERR, "could not bind address provided!");
-        exit(EXIT_SOCKET_FAILURE);
-    }
-
-    if (b_daemonize)
-    {
-        if (!daemonize_process())
-        {
-            syslog(LOG_ERR, "could not daemonize!");
-            exit(EXIT_SOCKET_FAILURE);
-        }
-        else
-        {
-            syslog(LOG_DEBUG, "daemonized successfully!");
-        }
-    }
-
-    return_code = listen(h_sockfd, BACKLOG);
-    if (-1 == return_code)
-    {
-        syslog(LOG_ERR, "listen failed with error: %s\n", strerror(errno));
-        exit(EXIT_SOCKET_FAILURE);
-    }
-
-    if (!open_socket_data_file(SOCKET_DATA_FILE_PATHNAME, &ph_socket_data_file))
-    {
-        syslog(LOG_ERR, "could not create/open %s", SOCKET_DATA_FILE_PATHNAME);
-        exit(EXIT_APP_FAILURE);
-    }
-    
-    if (!assign_signal_handler())
-    {
-        syslog(LOG_ERR, "could not assign sigaction");
-        exit(EXIT_APP_FAILURE);
-    }
-
-    while (b_accept_connections)
-    {
-        socklen_t remote_client_addr_size = sizeof(remote_client_addr);
-        h_recvfd = accept(h_sockfd, (struct sockaddr *)&remote_client_addr, &remote_client_addr_size); 
-        if (-1 == h_recvfd)
-        {
-            syslog(LOG_ERR, "accept failed with error: %s\n", strerror(errno));
-            break;
-        }
-        else
-        {
-            // log message to syslog "Accecpted connection from xxxx"
-            if (NULL == inet_ntop(AF_INET, &remote_client_addr.sin_addr, p_ip_addr_buffer, sizeof(p_ip_addr_buffer)))
-            {
-                syslog(LOG_ERR, "inet_ntop failed with error: %s\n", strerror(errno));
-                break;
-            }
-            syslog(LOG_DEBUG, "Accepted connection from %s\n", p_ip_addr_buffer);
-        }
-
-        // connection is now open, block signals till operations are complete
-        if (!block_signals(&sig_mask))
-        {
-            syslog(LOG_ERR, "could not block signals!");
-            break;
-        }
-
-        char p_buffer[RECV_BUF_LEN] = {0};
-        int malloc_buf_size = 0;
-        int byte_string_len = 0;
-        char * p_malloc_buf = NULL;
-        char * p_tmp = NULL;
+        // log accept connection message
+        syslog(LOG_DEBUG, "Accepted connection from %s\n", p_ip_addr_buffer);
         while (true)
         {
-            int bytes_recv = recv(h_recvfd, p_buffer, RECV_BUF_LEN - 1, 0);
+            int bytes_recv = recv(p_thread_args->h_recvfd, p_buffer, RECV_BUF_LEN - 1, 0);
             if (-1 == bytes_recv)
             {
                 syslog(LOG_ERR, "recv failed with error %s", strerror(errno));
@@ -437,7 +341,6 @@ int main(const int argc, char ** const p_argv)
             }
             else
             {
-                free(p_malloc_buf);
                 break;
             }
 
@@ -455,8 +358,21 @@ int main(const int argc, char ** const p_argv)
             // if contains newline, write to file, and perform writeback
             if (b_contains_newline)
             {
+                // acquire mutex
+                return_code = pthread_mutex_lock(p_thread_args->p_mutex);
+                if (return_code != 0)
+                {
+                    syslog(LOG_ERR, "mutex lock failed with error %s", strerror(return_code));
+                }
+
+                // open socket data file in append mode 
+                if (!open_socket_data_file(SOCKET_DATA_FILE_PATHNAME, &ph_socket_data_file))
+                {
+                    syslog(LOG_ERR, "could not create/open %s", SOCKET_DATA_FILE_PATHNAME);
+                }
+
+                // write to file
                 int bytes_written = fprintf(ph_socket_data_file, "%s", p_malloc_buf);
-                free(p_malloc_buf); // no longer needed
 
                 if (bytes_written != byte_string_len)
                 {
@@ -467,32 +383,264 @@ int main(const int argc, char ** const p_argv)
                     syslog(LOG_ERR, "fprintf failed with error %s", strerror(errno));
                 }
 
-                if (!writeback(ph_socket_data_file, h_recvfd))
+                // send socketdatafile contents back over socket connection
+                if (!writeback(ph_socket_data_file, p_thread_args->h_recvfd))
                 {
                     syslog(LOG_ERR, "writeback failed!");
                     break;
                 }
+
+                // close socket data file
+                fclose(ph_socket_data_file);
+
+                // release mutex
+                return_code = pthread_mutex_unlock(p_thread_args->p_mutex);
+                if (return_code != 0)
+                {
+                    syslog(LOG_ERR, "mutex unlock failed with error %s", strerror(return_code));
+                }
             }
         }
-        // logs messsage to syslog "Closed connection from XXX"
-        syslog(LOG_DEBUG, "Closed connection from %s\n", p_ip_addr_buffer);
+    }
 
-        // connection is now closed, unblock signals 
-        if (!unblock_signals(&sig_mask))
+    // free malloc'd data
+    free(p_malloc_buf); 
+
+    // logs closed connection message
+    syslog(LOG_DEBUG, "Closed connection from %s\n", p_ip_addr_buffer);
+    p_thread_args->b_is_thread_complete = true;
+    return NULL;
+}
+
+// @brief periodic timer callback, appends timestamp to socketdata file
+static void timer_callback(union sigval)
+{
+    char timestamp[MAX_TIMESTAMP_LEN];
+    int return_code;
+    FILE * ph_socket_data_file = NULL;
+
+    time_t seconds_since_epoch = time(NULL);
+    struct tm * p_broken_down_time = localtime(&seconds_since_epoch);
+    if (NULL == p_broken_down_time)
+    {
+        syslog(LOG_ERR, "local time failed with error %s", strerror(errno));
+    }
+
+    strftime(timestamp, sizeof(timestamp)/sizeof(timestamp[0]), "%a, %d %b %Y %T %z", p_broken_down_time);
+    syslog(LOG_DEBUG, "timestamp:%s", timestamp);
+
+    // acquire mutex
+    return_code = pthread_mutex_lock(&mutex);
+    if (return_code != 0)
+    {
+        syslog(LOG_ERR, "mutex lock failed with error %s", strerror(return_code));
+    }
+
+    // open socketdata file in append mode
+    if (!open_socket_data_file(SOCKET_DATA_FILE_PATHNAME, &ph_socket_data_file))
+    {
+        syslog(LOG_ERR, "could not create/open %s", SOCKET_DATA_FILE_PATHNAME);
+    }
+
+    // write timestamp to file
+    int bytes_written = fprintf(ph_socket_data_file, "timestamp:%s\n", timestamp);
+
+    if (bytes_written < 0)
+    {
+        syslog(LOG_ERR, "fprintf failed with error %s", strerror(errno));
+    }
+
+    // close file
+    fclose(ph_socket_data_file);
+
+    // release mutex
+    return_code = pthread_mutex_unlock(&mutex);
+    if (return_code != 0)
+    {
+        syslog(LOG_ERR, "mutex unlock failed with error %s", strerror(return_code));
+    }
+}
+
+int main(const int argc, char ** const p_argv)
+{
+    int return_code = 0;
+
+    // check if more than the supported number of arguements have 
+    // been provided
+    if (argc > 2)
+    {
+        syslog(LOG_ERR, "Invalid number of arguement");
+        print_help_str();
+        exit(EXIT_APP_FAILURE);
+    }
+
+    int opt_char;
+    bool b_daemonize = false;
+
+    // check if -d flag provided to daemonsize process
+    while ((opt_char = getopt(argc, p_argv, "d")) != -1)
+    {
+        switch (opt_char)
         {
-            syslog(LOG_ERR, "could not unblock signals!");
+            case 'd':
+                b_daemonize = true;
+            break;
+
+            default:
+                syslog(LOG_ERR, "Invalid option %c!", opt_char);
+                print_help_str();
+                exit(EXIT_APP_FAILURE);
             break;
         }
     }
 
-    if (-1 == remove(SOCKET_DATA_FILE_PATHNAME))
+    int h_sockfd = 0;
+    if (!bind_to_address(NULL, PORT, &h_sockfd))
     {
-        syslog(LOG_DEBUG, "remove failed with error %s", strerror(errno));
+        syslog(LOG_ERR, "could not bind address provided!");
+        exit(EXIT_SOCKET_FAILURE);
     }
 
-    // h_recvfd closed when recv is complete
+    if (b_daemonize)
+    {
+        if (!daemonize_process())
+        {
+            syslog(LOG_ERR, "could not daemonize!");
+            exit(EXIT_SOCKET_FAILURE);
+        }
+        else
+        {
+            syslog(LOG_DEBUG, "daemonized successfully!");
+        }
+    }
+
+    // note: timer must be created in child process, because 
+    // child does not inherit timer from parent
+    timer_t timer;
+    struct sigevent evp = {0};
+
+    // start after 10s and repeat every 10s
+    struct itimerspec interval_timer_spec = {
+        .it_interval={.tv_sec=10,.tv_nsec=0},
+        .it_value={.tv_sec=10,.tv_nsec=0},
+    };
+
+    // create a new thread when timer expires
+    evp.sigev_notify = SIGEV_THREAD;
+    evp.sigev_notify_function = timer_callback;
+
+    if (-1 == timer_create(CLOCK_MONOTONIC, &evp, &timer))
+    {
+        syslog(LOG_ERR, "timer_create failed with error: %s\n", strerror(errno));
+    }
+    else if (-1 == timer_settime(timer, 0, &interval_timer_spec, NULL))
+    {
+        syslog(LOG_ERR, "timer_settime failed with error: %s\n", strerror(errno));
+    }
+
+    if (!assign_signal_handler())
+    {
+        syslog(LOG_ERR, "could not assign sigaction");
+        exit(EXIT_APP_FAILURE);
+    }
+
+    return_code = listen(h_sockfd, BACKLOG);
+    if (-1 == return_code)
+    {
+        syslog(LOG_ERR, "listen failed with error: %s\n", strerror(errno));
+        exit(EXIT_SOCKET_FAILURE);
+    }
+
+    // initialize linked list
+    struct slist_head_s slist_head;
+    SLIST_INIT(&slist_head);
+
+    while (b_accept_connections)
+    {
+        struct sockaddr_in remote_client_addr;
+        socklen_t remote_client_addr_size = sizeof(remote_client_addr);
+
+        int h_recvfd = accept(h_sockfd, (struct sockaddr *)&remote_client_addr, &remote_client_addr_size); 
+        if (-1 == h_recvfd)
+        {
+            syslog(LOG_ERR, "accept failed with error: %s\n", strerror(errno));
+            break;
+        }
+        else
+        {
+            // create thread and save thread args structure on linked list
+            struct slist_entry_s * p_slist_entry;
+            p_slist_entry = malloc(sizeof(struct slist_entry_s));
+            if (NULL == p_slist_entry)
+            {
+                syslog(LOG_ERR, "malloc failed, could not create new thread, exiting!");
+            }
+            else 
+            {
+                p_slist_entry->thread_args.h_recvfd = h_recvfd;
+                p_slist_entry->thread_args.p_mutex = &mutex;
+                p_slist_entry->thread_args.remote_client_address = remote_client_addr;
+                p_slist_entry->thread_args.b_is_thread_complete = false;
+                return_code = pthread_create(&p_slist_entry->thread_args.tid, NULL, service_thread, (void *)p_slist_entry);
+                if (return_code != 0)
+                {
+                    syslog(LOG_ERR, "thread create failed with error %s", strerror(return_code));
+                    free(p_slist_entry);
+                }
+                else
+                {
+                    SLIST_INSERT_HEAD(&slist_head, p_slist_entry, slist_entries);
+                }
+            }
+        }
+
+        // check for closed threads to pthread join them, and free 
+        // malloc'd memory
+        struct slist_entry_s * p_slist_entry = SLIST_FIRST(&slist_head);
+        while (p_slist_entry)
+        {
+            if (p_slist_entry->thread_args.b_is_thread_complete)
+            {
+                return_code = pthread_join(p_slist_entry->thread_args.tid, NULL);
+                if (return_code != 0)
+                {
+                    syslog(LOG_ERR, "pthread join failed with error %s", strerror(return_code));
+                }
+                SLIST_REMOVE(&slist_head, p_slist_entry, slist_entry_s, slist_entries);
+                free(p_slist_entry);
+            }
+            p_slist_entry = SLIST_NEXT(p_slist_entry, slist_entries);
+        }
+    }
+
+    // cleanup!
+
+    // signal to terminate recevied, join every thread
+    // and free malloc'd memory
+    while (!SLIST_EMPTY(&slist_head))
+    {
+        struct slist_entry_s * p_slist_entry = SLIST_FIRST(&slist_head);
+        return_code = pthread_join(p_slist_entry->thread_args.tid, NULL);
+        if (return_code != 0)
+        {
+            syslog(LOG_ERR, "pthread join failed with error %s", strerror(return_code));
+        }
+        SLIST_REMOVE_HEAD(&slist_head, slist_entries);
+        free(p_slist_entry);
+    }
+
+    if (-1 == remove(SOCKET_DATA_FILE_PATHNAME))
+    {
+        syslog(LOG_ERR, "remove failed with error %s", strerror(errno));
+    }
+
+    // h_recvfd closed when recv is complete in respective thread
     close(h_sockfd);
-    fclose(ph_socket_data_file);
+
+    if (-1 == timer_delete(timer))
+    {
+        syslog(LOG_ERR, "timer_delete failed with error %s", strerror(errno));
+    }
 
     if (b_accept_connections == false)
     {
