@@ -387,7 +387,6 @@ static void * service_thread(void * p_arg)
                 if (!writeback(ph_socket_data_file, p_thread_args->h_recvfd))
                 {
                     syslog(LOG_ERR, "writeback failed!");
-                    break;
                 }
 
                 // close socket data file
