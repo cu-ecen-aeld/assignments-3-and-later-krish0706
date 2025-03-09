@@ -60,3 +60,25 @@ ssize_t faulty_write (struct file *filp, const char __user *buf, size_t count,
 	return 0;
 }
 ```
+
+By using the following command from the base assignment 5 directory, we can access the objdump of the `faulty` kernel module and observe the exact instruction where the error occurs:
+``` 
+./buildroot/output/host/bin/aarch64-linux-objdump -S ./buildroot/output/target/lib/modules/6.1.44/extra/faulty.ko
+```
+
+This command gives the following output:
+```
+...
+0000000000000000 <faulty_write>:
+   0:   d2800001        mov     x1, #0x0                        // #0
+   4:   d2800000        mov     x0, #0x0                        // #0
+   8:   d503233f        paciasp
+   c:   d50323bf        autiasp
+  10:   b900003f        str     wzr, [x1]
+  14:   d65f03c0        ret
+  18:   d503201f        nop
+  1c:   d503201f        nop
+...
+```
+
+Here, we can observe that `x1` is loaded with the value `0x0` and then the `str` instruction at the offset `0x10` tries to access the location pointed to by x1, which causes the null pointer dereference. 
