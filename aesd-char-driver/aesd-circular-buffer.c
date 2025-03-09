@@ -29,7 +29,7 @@
 struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn )
 {
-    // find which entry the fpos maps to, wrt out_fs
+    // find which entry the fpos maps to, wrt out_offs
     struct aesd_buffer_entry * p_entry = NULL;
     size_t current_string_size = 0;
     uint8_t offset = buffer->out_offs;
