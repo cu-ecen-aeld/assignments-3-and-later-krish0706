@@ -23,7 +23,13 @@
 #include <fcntl.h>
 #include <pthread.h>
 
+#define USE_AESD_CHAR_DEVICE 1
+#if USE_AESD_CHAR_DEVICE == 1
+#define SOCKET_DATA_FILE_PATHNAME "/dev/aesdchar"
+#else
 #define SOCKET_DATA_FILE_PATHNAME "/var/tmp/aesdsocketdata"
+#endif
+
 #define PORT "9000" // the port to connect to
 #define BACKLOG 10
 #define RECV_BUF_LEN 100
@@ -176,12 +182,15 @@ static bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
     bool b_send_fail = false;
 
     // set file offet to 0 before reading
+
+#if USE_AESD_CHAR_DEVICE != 1
     if (-1 == fseek(ph_socket_data_file, 0, SEEK_SET))
     {
         syslog(LOG_ERR, "fseek set failed with error %s", strerror(errno));
         b_status = false;
     }
     else
+#endif
     {
         while (!b_send_fail)
         {
@@ -211,12 +220,6 @@ static bool writeback(FILE * const ph_socket_data_file, const int h_recvfd)
     }
 
     free(p_line); 
-
-    if (-1 == fseek(ph_socket_data_file, 0, SEEK_END))
-    {
-        syslog(LOG_ERR, "fseek end failed with error %s", strerror(errno));
-        b_status = false;
-    }
 
     return b_status;
 }
@@ -411,6 +414,7 @@ static void * service_thread(void * p_arg)
     return NULL;
 }
 
+#if USE_AESD_CHAR_DEVICE != 1
 // @brief periodic timer callback, appends timestamp to socketdata file
 static void timer_callback(union sigval)
 {
@@ -459,6 +463,7 @@ static void timer_callback(union sigval)
         syslog(LOG_ERR, "mutex unlock failed with error %s", strerror(return_code));
     }
 }
+#endif
 
 int main(const int argc, char ** const p_argv)
 {
@@ -513,6 +518,7 @@ int main(const int argc, char ** const p_argv)
         }
     }
 
+#if USE_AESD_CHAR_DEVICE != 1
     // note: timer must be created in child process, because 
     // child does not inherit timer from parent
     timer_t timer;
@@ -536,6 +542,7 @@ int main(const int argc, char ** const p_argv)
     {
         syslog(LOG_ERR, "timer_settime failed with error: %s\n", strerror(errno));
     }
+#endif
 
     if (!assign_signal_handler())
     {
@@ -628,18 +635,21 @@ int main(const int argc, char ** const p_argv)
         free(p_slist_entry);
     }
 
+#if USE_AESD_CHAR_DEVICE != 1
     if (-1 == remove(SOCKET_DATA_FILE_PATHNAME))
     {
         syslog(LOG_ERR, "remove failed with error %s", strerror(errno));
     }
-
+#endif
     // h_recvfd closed when recv is complete in respective thread
     close(h_sockfd);
 
+#if USE_AESD_CHAR_DEVICE != 1
     if (-1 == timer_delete(timer))
     {
         syslog(LOG_ERR, "timer_delete failed with error %s", strerror(errno));
     }
+#endif
 
     if (b_accept_connections == false)
     {
