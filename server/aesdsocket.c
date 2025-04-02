@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/queue.h>
+#include <sys/ioctl.h>
 #include <netdb.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -22,6 +23,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define USE_AESD_CHAR_DEVICE 1
 #if USE_AESD_CHAR_DEVICE == 1
@@ -37,6 +39,8 @@
 #define EXIT_SOCKET_FAILURE (-1)
 #define EXIT_APP_FAILURE (-1)
 #define MAX_TIMESTAMP_LEN 995
+#define AESDCHAR_IOCSEEKTO_CMD_STR "AESDCHAR_IOCSEEKTO"
+#define AESDCHAR_IOCSEEKTO_FMT_STR "AESDCHAR_IOCSEEKTO:%u,%u"
 
 struct thread_args_s
 {
@@ -374,16 +378,42 @@ static void * service_thread(void * p_arg)
                     syslog(LOG_ERR, "could not create/open %s", SOCKET_DATA_FILE_PATHNAME);
                 }
 
-                // write to file
-                int bytes_written = fprintf(ph_socket_data_file, "%s", p_malloc_buf);
 
-                if (bytes_written != byte_string_len)
+                bool b_contains_aesd_char_cmd = (strstr(p_malloc_buf, AESDCHAR_IOCSEEKTO_CMD_STR)) ? true : false;
+                
+                if (!b_contains_aesd_char_cmd)
                 {
-                    syslog(LOG_ERR, "fprintf did not complete write to socket data file");
+                    // write to file, if received string does not contain aesd char command
+                    int bytes_written = fprintf(ph_socket_data_file, "%s", p_malloc_buf);
+
+                    if (bytes_written != byte_string_len)
+                    {
+                        syslog(LOG_ERR, "fprintf did not complete write to socket data file");
+                    }
+                    else if (bytes_written < 0)
+                    {
+                        syslog(LOG_ERR, "fprintf failed with error %s", strerror(errno));
+                    }
                 }
-                else if (bytes_written < 0)
+                else
                 {
-                    syslog(LOG_ERR, "fprintf failed with error %s", strerror(errno));
+                    struct aesd_seekto seekto;
+
+                    // read write_cmd and offset from string
+                    sscanf(p_malloc_buf, AESDCHAR_IOCSEEKTO_FMT_STR, &seekto.write_cmd, &seekto.write_cmd_offset);
+
+                    int fd = fileno(ph_socket_data_file);
+                    if (-1 == fd)
+                    {
+                        syslog(LOG_ERR, "fileno failed with error %s", strerror(errno));
+                    }
+
+                    // send cmd to aesdchar driver
+                    int result = ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto);
+                    if (result < 0)
+                    {
+                        syslog(LOG_ERR, "ioctl failed with error %s", strerror(errno));
+                    }
                 }
 
                 // send socketdatafile contents back over socket connection

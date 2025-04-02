@@ -20,6 +20,8 @@
 #include <linux/fs.h> // file_operations
 #include "aesd-circular-buffer.h"
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -33,6 +35,8 @@ int aesd_open (struct inode *inode, struct file *filp);
 int aesd_release (struct inode *inode, struct file *filp);
 ssize_t aesd_read (struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 ssize_t aesd_write (struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+loff_t aesd_llseek (struct file * filp, loff_t off, int whence);
+long aesd_ioctl (struct file * filep, unsigned int cmd, unsigned long arg);
 int aesd_init_module (void);
 void aesd_cleanup_module (void);
 
@@ -166,12 +170,143 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         return retval;
 }
 
+loff_t aesd_llseek(struct file * filp, loff_t off, int whence)
+{
+    PDEBUG("llseek %d offset %lld\n", whence, off);
+    struct aesd_dev * p_dev = filp->private_data;
+    loff_t newpos;
+    
+    switch (whence)
+    {
+        case 0: // SEEK_SET
+            // set newpos to off
+            newpos = off;
+        break;
+
+        case 1: // SEEK_CUR
+            // set newpos to current pos + off
+            newpos = filp->f_pos + off;
+        break;
+
+        case 2: // SEEK_END
+            // we need to make sure that our access to the circular buffer is atomic, so that the size does
+            // not change when we are measuring it
+
+            // acquire mutex
+            if (mutex_lock_interruptible(&p_dev->lock))
+            {
+                return -ERESTARTSYS;
+            }
+            
+            int file_size = 0;
+            for (int idx = p_dev->circular_buffer.out_offs; 
+                 idx != p_dev->circular_buffer.in_offs; 
+                 idx = (idx+1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+            {
+                // each command has a size, including the '\n', add them all up
+                // to find the size of the entire file 
+                file_size += p_dev->circular_buffer.entry[idx].size;
+            }
+
+            // free mutex
+            mutex_unlock(&p_dev->lock);
+
+            // end of file be at position file_size - 1
+            newpos = file_size - 1 + off;
+        break;
+
+        default:
+            return -EINVAL;
+        break;
+    }
+
+    if (newpos < 0)
+    {
+        return -EINVAL;
+    }
+    filp->f_pos = newpos;
+
+    return newpos;
+}
+
+long aesd_ioctl(struct file * filp, unsigned int cmd, unsigned long arg)
+{
+    PDEBUG("ioctl\n");
+    int retval = 0;
+    struct aesd_dev * p_dev = filp->private_data;
+    struct aesd_seekto seekto;
+
+    switch (cmd)
+    {
+        case AESDCHAR_IOCSEEKTO:
+            PDEBUG("AESDCHAR_IOCSEEKTO\n");
+            if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)))
+            {
+                retval = -EFAULT;
+            }
+            else
+            {
+                // acquire mutex
+                if (mutex_lock_interruptible(&p_dev->lock))
+                {
+                    return -ERESTARTSYS;
+                }
+
+                if (seekto.write_cmd > AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+                {
+                    // not enough cmds in buffer
+                    PDEBUG("Not enough cmds in buffer!\n");
+                    retval = -EINVAL;
+                }
+                else
+                {
+                    int cmd_idx = (seekto.write_cmd + p_dev->circular_buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                    int cmd_size = p_dev->circular_buffer.entry[cmd_idx].size;
+                    if (seekto.write_cmd_offset < cmd_size)
+                    {
+                        int write_cmd_offset = 0;
+                        for (int idx = p_dev->circular_buffer.out_offs; 
+                            idx != cmd_idx; 
+                            idx = (idx+1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+                        {
+                            // each command has a size, including the '\n', add them all up
+                            // to find the size of the entire file 
+                            write_cmd_offset += p_dev->circular_buffer.entry[idx].size;
+                        }
+
+                        write_cmd_offset += seekto.write_cmd_offset;
+                        filp->f_pos += write_cmd_offset;
+                    }
+                    else
+                    {
+                        // not enough characters in entry
+                        PDEBUG("Not enough characters in entry!");
+                        retval = -EINVAL;
+                    }
+                }
+                
+                // free mutex
+                mutex_unlock(&p_dev->lock);
+            }
+        break;
+
+        default:
+            PDEBUG("IOCTL default\n");
+            retval = -EINVAL;
+        break;
+    }
+
+    return retval;
+}
+
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner =          THIS_MODULE,
+    .read =           aesd_read,
+    .write =          aesd_write,
+    .open =           aesd_open,
+    .release =        aesd_release,
+    .llseek =         aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -208,7 +343,6 @@ int __init aesd_init_module(void)
         unregister_chrdev_region(dev, 1); 
     }
     return result;
-
 }
 
 module_init(aesd_init_module);
